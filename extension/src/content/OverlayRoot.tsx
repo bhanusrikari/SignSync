@@ -60,13 +60,6 @@ export function OverlayRoot() {
   // closure once `gesture` changes, so state.speechOutput/state.language are
   // still current at that point despite not being listed as dependencies.
   useEffect(() => {
-    // TEMPORARY diagnostic for the "no audible speech" investigation --
-    // remove once root-caused.
-    console.log("[SignSync DEBUG] speak-effect fired", {
-      gesture,
-      speechOutput: state.speechOutput,
-      language: state.language,
-    });
     if (!gesture || !gesture.text) return; // UNKNOWN (or unmapped) is never spoken
     if (!state.speechOutput) return;
     speakText(gesture.text, state.language);
