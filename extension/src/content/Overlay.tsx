@@ -8,11 +8,22 @@ interface OverlayProps {
   /** Latest stabilized gesture event, or null if none has arrived yet
    *  (or gesture recognition is off/was just turned off). */
   gesture: GestureDetectedPayload | null;
+  /** Recent recognized-gesture text, oldest first, bounded to MAX_HISTORY
+   *  (see OverlayRoot.tsx). UNKNOWN gestures are never included. */
+  history: string[];
+  onClearHistory: () => void;
   onDisable: () => void;
   onPositionChange: (position: OverlayPosition) => void;
 }
 
-export function Overlay({ state, gesture, onDisable, onPositionChange }: OverlayProps) {
+export function Overlay({
+  state,
+  gesture,
+  history,
+  onClearHistory,
+  onDisable,
+  onPositionChange,
+}: OverlayProps) {
   const [position, setPosition] = useState<OverlayPosition>(state.overlayPosition);
   const dragState = useRef<{ startX: number; startY: number; origin: OverlayPosition } | null>(
     null,
@@ -100,6 +111,26 @@ export function Overlay({ state, gesture, onDisable, onPositionChange }: Overlay
           {secondaryText && (
             <div className="pl-6 text-xs font-semibold text-brand-700">{secondaryText}</div>
           )}
+        </div>
+
+        <div>
+          <div className="flex items-center justify-between">
+            <span className="text-xs font-semibold uppercase tracking-wide text-slate-400">
+              Recent
+            </span>
+            {history.length > 0 && (
+              <button
+                type="button"
+                onClick={onClearHistory}
+                className="text-xs font-medium text-slate-400 hover:text-slate-600"
+              >
+                Clear
+              </button>
+            )}
+          </div>
+          <p className="truncate text-sm text-slate-600">
+            {history.length > 0 ? history.join(" · ") : "Start signing..."}
+          </p>
         </div>
 
         <div className="flex items-center gap-2 text-slate-600">
