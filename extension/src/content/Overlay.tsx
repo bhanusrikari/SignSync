@@ -55,7 +55,7 @@ export function Overlay({ state, onDisable, onPositionChange }: OverlayProps) {
 
   return (
     <div
-      className="signsync-root fixed w-72 select-none rounded-xl border border-slate-200 bg-white/95 font-sans shadow-2xl backdrop-blur"
+      className="signsync-root fixed w-80 max-w-[calc(100vw_-_40px)] select-none rounded-xl border border-slate-200 bg-white/95 font-sans shadow-2xl backdrop-blur"
       style={{ right: position.x, bottom: position.y, zIndex: 2147483647 }}
     >
       <div
