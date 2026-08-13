@@ -1,9 +1,9 @@
 /**
- * Owns camera capture for SignSync gesture recognition, and -- once the
- * camera is running -- hand-landmark detection against that same stream (see
- * gesture-recognition plan). No gesture classification, feature extraction,
- * or smoothing yet: this only proves camera-in, landmarks-out. Started/
- * stopped by the background service worker via GESTURE_CAMERA_START /
+ * Owns camera capture for SignSync gesture recognition, hand-landmark
+ * detection against that stream, and (new) turning those landmarks into a
+ * stabilized gesture via the feature-extraction -> classification ->
+ * temporal-stabilization pipeline in src/ai/gesture*. Started/stopped by
+ * the background service worker via GESTURE_CAMERA_START /
  * GESTURE_CAMERA_STOP, in response to the Gesture Recognition toggle in the
  * popup.
  *
@@ -17,6 +17,25 @@
 import { classifyCameraError, describeError } from "@/shared/camera";
 import type { CameraDiagnostics } from "@/shared/camera";
 import { detectHands, disposeHandTracker, isHandTrackerLoaded, loadHandTracker } from "@/ai/handTracker";
+import { extractHandFeatures } from "@/ai/gestureFeatures";
+import { RuleBasedGestureClassifier } from "@/ai/gestureClassifier";
+import { GestureStabilizer } from "@/ai/gestureStabilizer";
+import type { GestureClassifier, StableGestureEvent } from "@/ai/gestureTypes";
+
+// Long-lived: constructed once, reused across every detection tick (and
+// across stop/start cycles -- reset() clears history, not the instances).
+const gestureClassifier: GestureClassifier = new RuleBasedGestureClassifier();
+const gestureStabilizer = new GestureStabilizer();
+
+function logStableGesture(event: StableGestureEvent): void {
+  if (event.gesture === "UNKNOWN") {
+    console.log("[SignSync] Gesture unknown");
+    return;
+  }
+  console.log(
+    `[SignSync] Gesture detected:\ngesture=${event.gesture}\nconfidence=${event.confidence.toFixed(2)}`,
+  );
+}
 
 /** How often to run hand detection against the current video frame.
  *  Not tied to a render loop -- this document draws nothing but the raw
@@ -65,18 +84,33 @@ async function startHandTracking(): Promise<void> {
     try {
       const result = detectHands(videoEl, performance.now());
       if (result.handsDetected > 0) {
-        const wrist = result.landmarks[0][0];
+        // Single-hand classifier: use the first detected hand only. MediaPipe
+        // is already configured with numHands:1 (see handTracker.ts), so this
+        // is currently the only hand present, but the choice is documented
+        // explicitly since nothing here assumes that stays true forever.
+        const handLandmarks = result.landmarks[0];
+        const wrist = handLandmarks[0];
         console.log(
           `[SignSync] hand detected: ${result.handsDetected} hand(s), ` +
             `21 landmarks each. wrist=(${wrist.x.toFixed(3)}, ${wrist.y.toFixed(3)}, ${wrist.z.toFixed(3)})`,
         );
         setStatus(`Hand detected (${result.handsDetected})`);
+
+        const features = extractHandFeatures(handLandmarks);
+        const classification = gestureClassifier.classify(features);
+        const stableEvent = gestureStabilizer.push(classification, Date.now());
+        if (stableEvent) logStableGesture(stableEvent);
       } else {
         console.log("[SignSync] no hand detected");
         setStatus("No hand detected");
+
+        // Feed an UNKNOWN frame so a previously-stable gesture correctly
+        // decays once the hand leaves the frame, instead of staying stuck.
+        const stableEvent = gestureStabilizer.push({ gesture: "UNKNOWN", confidence: 0 }, Date.now());
+        if (stableEvent) logStableGesture(stableEvent);
       }
     } catch (error) {
-      console.error("[SignSync] detectHands failed:", error);
+      console.error("[SignSync] gesture pipeline tick failed:", error);
     }
   }, DETECTION_INTERVAL_MS);
 }
@@ -87,6 +121,7 @@ function stopHandTracking(): void {
     detectionTimer = undefined;
   }
   disposeHandTracker();
+  gestureStabilizer.reset();
 }
 
 async function startCamera(): Promise<CameraDiagnostics> {
