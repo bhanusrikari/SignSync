@@ -38,6 +38,15 @@ chrome.runtime.onMessage.addListener(
         applyAndBroadcast(message.payload).then(sendResponse);
         return true;
 
+      case "GESTURE_DETECTED":
+        // Relayed from the offscreen document. chrome.runtime.sendMessage
+        // can't reach a content script directly -- only chrome.tabs.sendMessage
+        // can, which needs tab ids the offscreen document doesn't have. The
+        // background worker is the one context that can enumerate tabs, so
+        // it's a required relay here, not optional forwarding.
+        broadcastToTabs(message).then(() => sendResponse({ ok: true }));
+        return true;
+
       default:
         return false;
     }

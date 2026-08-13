@@ -1,4 +1,4 @@
-import type { SignSyncMessage, StateUpdatedMessage } from "@/types";
+import type { BroadcastMessage, SignSyncMessage } from "@/types";
 
 /** Sends a typed message to the background service worker and awaits its response. */
 export function sendToBackground<TResponse = unknown>(
@@ -8,11 +8,11 @@ export function sendToBackground<TResponse = unknown>(
 }
 
 /**
- * Broadcasts a state update to every tab's content script. Tabs without an
- * injected content script (e.g. chrome:// pages) reject — that's expected
- * and safely ignored.
+ * Broadcasts a message (state update, gesture event, ...) to every tab's
+ * content script. Tabs without an injected content script (e.g. chrome://
+ * pages) reject — that's expected and safely ignored.
  */
-export async function broadcastToTabs(message: StateUpdatedMessage): Promise<void> {
+export async function broadcastToTabs(message: BroadcastMessage): Promise<void> {
   const tabs = await chrome.tabs.query({});
   await Promise.allSettled(
     tabs

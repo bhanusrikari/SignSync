@@ -21,20 +21,37 @@ import { extractHandFeatures } from "@/ai/gestureFeatures";
 import { RuleBasedGestureClassifier } from "@/ai/gestureClassifier";
 import { GestureStabilizer } from "@/ai/gestureStabilizer";
 import type { GestureClassifier, StableGestureEvent } from "@/ai/gestureTypes";
+import type { GestureDetectedMessage } from "@/types";
 
 // Long-lived: constructed once, reused across every detection tick (and
 // across stop/start cycles -- reset() clears history, not the instances).
 const gestureClassifier: GestureClassifier = new RuleBasedGestureClassifier();
 const gestureStabilizer = new GestureStabilizer();
 
-function logStableGesture(event: StableGestureEvent): void {
+/**
+ * Called once per STABLE gesture transition (never per detection frame --
+ * see GestureStabilizer). Logs for local diagnostics and relays a
+ * GESTURE_DETECTED message through the background worker so the content
+ * script's overlay can display it. A delivery failure here (e.g. the
+ * background worker restarting) must never stop hand tracking or the
+ * camera -- it's just swallowed with a warning.
+ */
+function handleStableGestureEvent(event: StableGestureEvent): void {
   if (event.gesture === "UNKNOWN") {
     console.log("[SignSync] Gesture unknown");
-    return;
+  } else {
+    console.log(
+      `[SignSync] Gesture detected:\ngesture=${event.gesture}\nconfidence=${event.confidence.toFixed(2)}`,
+    );
   }
-  console.log(
-    `[SignSync] Gesture detected:\ngesture=${event.gesture}\nconfidence=${event.confidence.toFixed(2)}`,
-  );
+
+  const message: GestureDetectedMessage = {
+    type: "GESTURE_DETECTED",
+    payload: { gesture: event.gesture, confidence: event.confidence, timestamp: event.timestamp },
+  };
+  chrome.runtime.sendMessage(message).catch((error) => {
+    console.warn("[SignSync] failed to send GESTURE_DETECTED:", error);
+  });
 }
 
 /** How often to run hand detection against the current video frame.
@@ -99,7 +116,7 @@ async function startHandTracking(): Promise<void> {
         const features = extractHandFeatures(handLandmarks);
         const classification = gestureClassifier.classify(features);
         const stableEvent = gestureStabilizer.push(classification, Date.now());
-        if (stableEvent) logStableGesture(stableEvent);
+        if (stableEvent) handleStableGestureEvent(stableEvent);
       } else {
         console.log("[SignSync] no hand detected");
         setStatus("No hand detected");
@@ -107,7 +124,7 @@ async function startHandTracking(): Promise<void> {
         // Feed an UNKNOWN frame so a previously-stable gesture correctly
         // decays once the hand leaves the frame, instead of staying stuck.
         const stableEvent = gestureStabilizer.push({ gesture: "UNKNOWN", confidence: 0 }, Date.now());
-        if (stableEvent) logStableGesture(stableEvent);
+        if (stableEvent) handleStableGestureEvent(stableEvent);
       }
     } catch (error) {
       console.error("[SignSync] gesture pipeline tick failed:", error);

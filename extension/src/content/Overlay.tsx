@@ -1,22 +1,18 @@
 import { useCallback, useRef, useState } from "react";
 import type { PointerEvent } from "react";
 import { Hand, Volume2, Captions, Settings, X, GripHorizontal } from "lucide-react";
-import type { OverlayPosition, SignSyncState } from "@/types";
+import type { GestureDetectedPayload, OverlayPosition, SignSyncState } from "@/types";
 
 interface OverlayProps {
   state: SignSyncState;
+  /** Latest stabilized gesture event, or null if none has arrived yet
+   *  (or gesture recognition is off/was just turned off). */
+  gesture: GestureDetectedPayload | null;
   onDisable: () => void;
   onPositionChange: (position: OverlayPosition) => void;
 }
 
-/**
- * Dummy data standing in for the future gesture-recognition pipeline
- * (see PRD.md §12-14 and TECH_SPEC.md §12-16). No AI runs here yet.
- */
-const DUMMY_GESTURE = "HELP";
-const DUMMY_CONFIDENCE = 0.94;
-
-export function Overlay({ state, onDisable, onPositionChange }: OverlayProps) {
+export function Overlay({ state, gesture, onDisable, onPositionChange }: OverlayProps) {
   const [position, setPosition] = useState<OverlayPosition>(state.overlayPosition);
   const dragState = useRef<{ startX: number; startY: number; origin: OverlayPosition } | null>(
     null,
@@ -53,6 +49,21 @@ export function Overlay({ state, onDisable, onPositionChange }: OverlayProps) {
     [position, onPositionChange],
   );
 
+  // "Gesture off" when the feature is disabled; a real gesture name +
+  // confidence once a stable, known gesture has arrived; an unobtrusive
+  // waiting state otherwise (no gesture yet, or the latest stable result is
+  // UNKNOWN -- e.g. no hand in frame).
+  let gestureDisplayText: string;
+  let confidenceText: string | null = null;
+  if (!state.gestureRecognition) {
+    gestureDisplayText = "Gesture off";
+  } else if (gesture && gesture.gesture !== "UNKNOWN") {
+    gestureDisplayText = gesture.gesture.replace(/_/g, " ");
+    confidenceText = `${Math.round(gesture.confidence * 100)}%`;
+  } else {
+    gestureDisplayText = "Waiting for gesture...";
+  }
+
   return (
     <div
       className="signsync-root fixed w-80 max-w-[calc(100vw_-_40px)] select-none rounded-xl border border-slate-200 bg-white/95 font-sans shadow-2xl backdrop-blur"
@@ -81,11 +92,11 @@ export function Overlay({ state, onDisable, onPositionChange }: OverlayProps) {
         <div className="flex items-center justify-between rounded-lg bg-slate-50 px-2.5 py-2">
           <div className="flex items-center gap-2 font-medium text-slate-900">
             <Hand className="h-4 w-4 text-brand-600" />
-            {state.gestureRecognition ? DUMMY_GESTURE : "Gesture off"}
+            {gestureDisplayText}
           </div>
-          {state.gestureRecognition && (
+          {confidenceText && (
             <span className="rounded-full bg-brand-50 px-2 py-0.5 text-xs font-semibold text-brand-700">
-              {Math.round(DUMMY_CONFIDENCE * 100)}%
+              {confidenceText}
             </span>
           )}
         </div>

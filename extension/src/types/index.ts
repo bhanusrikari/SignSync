@@ -1,3 +1,5 @@
+import type { GestureLabel } from "@/ai/gestureTypes";
+
 /** BCP-47 codes for the languages SignSync supports (see TECH_SPEC.md §22). */
 export type LanguageCode = "en-IN" | "hi-IN" | "te-IN";
 
@@ -25,7 +27,8 @@ export type MessageType =
   | "GET_STATE"
   | "SET_ENABLED"
   | "UPDATE_SETTINGS"
-  | "STATE_UPDATED";
+  | "STATE_UPDATED"
+  | "GESTURE_DETECTED";
 
 export interface GetStateMessage {
   type: "GET_STATE";
@@ -47,8 +50,33 @@ export interface StateUpdatedMessage {
   payload: SignSyncState;
 }
 
+export interface GestureDetectedPayload {
+  gesture: GestureLabel;
+  /** 0..1. For UNKNOWN, this is the best (but insufficient) template match. */
+  confidence: number;
+  timestamp: number;
+}
+
+/**
+ * Broadcast from the background worker whenever the gesture pipeline's
+ * stabilized gesture changes (see ai/gestureStabilizer.ts) -- one event per
+ * stable transition, not one per detection frame. `gesture: "UNKNOWN"` is a
+ * real transition too (e.g. the hand left the frame), not an absence of a
+ * message.
+ */
+export interface GestureDetectedMessage {
+  type: "GESTURE_DETECTED";
+  payload: GestureDetectedPayload;
+}
+
 export type SignSyncMessage =
   | GetStateMessage
   | SetEnabledMessage
   | UpdateSettingsMessage
-  | StateUpdatedMessage;
+  | StateUpdatedMessage
+  | GestureDetectedMessage;
+
+/** Messages the background worker broadcasts to every tab's content script,
+ *  as opposed to request/response messages a popup or content script sends
+ *  TO the background worker. */
+export type BroadcastMessage = StateUpdatedMessage | GestureDetectedMessage;
