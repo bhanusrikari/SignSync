@@ -49,19 +49,22 @@ export function Overlay({ state, gesture, onDisable, onPositionChange }: Overlay
     [position, onPositionChange],
   );
 
-  // "Gesture off" when the feature is disabled; a real gesture name +
-  // confidence once a stable, known gesture has arrived; an unobtrusive
-  // waiting state otherwise (no gesture yet, or the latest stable result is
-  // UNKNOWN -- e.g. no hand in frame).
-  let gestureDisplayText: string;
-  let confidenceText: string | null = null;
+  // Four states: feature off; not enabled long enough for a first event yet;
+  // a stable-but-unrecognized result (UNKNOWN -- e.g. no hand in frame); a
+  // real recognized gesture, where the mapped text (not the raw label) is
+  // the primary, prominent line and the label+confidence become secondary
+  // detail underneath it.
+  let primaryText: string;
+  let secondaryText: string | null = null;
   if (!state.gestureRecognition) {
-    gestureDisplayText = "Gesture off";
-  } else if (gesture && gesture.gesture !== "UNKNOWN") {
-    gestureDisplayText = gesture.gesture.replace(/_/g, " ");
-    confidenceText = `${Math.round(gesture.confidence * 100)}%`;
+    primaryText = "Gesture off";
+  } else if (!gesture) {
+    primaryText = "Waiting for gesture...";
+  } else if (gesture.gesture === "UNKNOWN") {
+    primaryText = "Gesture not recognized";
   } else {
-    gestureDisplayText = "Waiting for gesture...";
+    primaryText = gesture.text ?? gesture.gesture.replace(/_/g, " ");
+    secondaryText = `${gesture.gesture.replace(/_/g, " ")} · ${Math.round(gesture.confidence * 100)}%`;
   }
 
   return (
@@ -89,15 +92,13 @@ export function Overlay({ state, gesture, onDisable, onPositionChange }: Overlay
       </div>
 
       <div className="space-y-2.5 px-3 py-3 text-sm text-slate-700">
-        <div className="flex items-center justify-between rounded-lg bg-slate-50 px-2.5 py-2">
+        <div className="rounded-lg bg-slate-50 px-2.5 py-2">
           <div className="flex items-center gap-2 font-medium text-slate-900">
             <Hand className="h-4 w-4 text-brand-600" />
-            {gestureDisplayText}
+            {primaryText}
           </div>
-          {confidenceText && (
-            <span className="rounded-full bg-brand-50 px-2 py-0.5 text-xs font-semibold text-brand-700">
-              {confidenceText}
-            </span>
+          {secondaryText && (
+            <div className="pl-6 text-xs font-semibold text-brand-700">{secondaryText}</div>
           )}
         </div>
 

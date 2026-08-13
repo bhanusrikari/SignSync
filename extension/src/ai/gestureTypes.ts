@@ -56,3 +56,16 @@ export interface StableGestureEvent {
   confidence: number;
   timestamp: number;
 }
+
+/**
+ * A stabilized gesture plus the user-facing text it maps to (see
+ * gestureVocabulary.ts). `text` is null when the gesture is UNKNOWN or
+ * otherwise unmapped. These are prototype gesture-command meanings for this
+ * implementation, not formal sign-language translations.
+ */
+export interface RecognizedGestureText {
+  gesture: GestureLabel;
+  text: string | null;
+  confidence: number;
+  timestamp: number;
+}
