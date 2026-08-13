@@ -20,6 +20,7 @@ import { detectHands, disposeHandTracker, isHandTrackerLoaded, loadHandTracker }
 import { extractHandFeatures } from "@/ai/gestureFeatures";
 import { RuleBasedGestureClassifier } from "@/ai/gestureClassifier";
 import { GestureStabilizer } from "@/ai/gestureStabilizer";
+import { mapToRecognizedGestureText } from "@/ai/gestureVocabulary";
 import type { GestureClassifier, StableGestureEvent } from "@/ai/gestureTypes";
 import type { GestureDetectedMessage } from "@/types";
 
@@ -30,25 +31,26 @@ const gestureStabilizer = new GestureStabilizer();
 
 /**
  * Called once per STABLE gesture transition (never per detection frame --
- * see GestureStabilizer). Logs for local diagnostics and relays a
+ * see GestureStabilizer). Maps the gesture to its user-facing text (see
+ * gestureVocabulary.ts), logs for local diagnostics, and relays a
  * GESTURE_DETECTED message through the background worker so the content
  * script's overlay can display it. A delivery failure here (e.g. the
  * background worker restarting) must never stop hand tracking or the
  * camera -- it's just swallowed with a warning.
  */
 function handleStableGestureEvent(event: StableGestureEvent): void {
-  if (event.gesture === "UNKNOWN") {
+  const recognized = mapToRecognizedGestureText(event);
+
+  if (recognized.gesture === "UNKNOWN") {
     console.log("[SignSync] Gesture unknown");
   } else {
     console.log(
-      `[SignSync] Gesture detected:\ngesture=${event.gesture}\nconfidence=${event.confidence.toFixed(2)}`,
+      `[SignSync] Gesture detected:\ngesture=${recognized.gesture}\ntext=${recognized.text}\n` +
+        `confidence=${recognized.confidence.toFixed(2)}`,
     );
   }
 
-  const message: GestureDetectedMessage = {
-    type: "GESTURE_DETECTED",
-    payload: { gesture: event.gesture, confidence: event.confidence, timestamp: event.timestamp },
-  };
+  const message: GestureDetectedMessage = { type: "GESTURE_DETECTED", payload: recognized };
   chrome.runtime.sendMessage(message).catch((error) => {
     console.warn("[SignSync] failed to send GESTURE_DETECTED:", error);
   });

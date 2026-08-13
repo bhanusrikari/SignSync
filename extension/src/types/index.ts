@@ -52,6 +52,11 @@ export interface StateUpdatedMessage {
 
 export interface GestureDetectedPayload {
   gesture: GestureLabel;
+  /** User-facing prototype-gesture text (see ai/gestureVocabulary.ts) --
+   *  null when the gesture is UNKNOWN or otherwise unmapped. These are
+   *  prototype gesture commands for this implementation, not formal
+   *  sign-language translations. */
+  text: string | null;
   /** 0..1. For UNKNOWN, this is the best (but insufficient) template match. */
   confidence: number;
   timestamp: number;
