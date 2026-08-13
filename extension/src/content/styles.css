@@ -2,16 +2,27 @@
  * Injected into the overlay's Shadow DOM only, so these rules never leak
  * onto the host page. We skip @tailwind base (the page already has its own
  * reset) and only pull in the utility classes the overlay actually uses.
+ *
+ * This reset MUST come before @tailwind utilities: `all: initial` and
+ * Tailwind's utility classes (.fixed, .w-80, etc.) are both single-class
+ * selectors, so they have equal specificity -- whichever is LATER in the
+ * compiled stylesheet wins any conflicting property. Reset first (blocks
+ * inherited host-page styles like font-family/color from leaking in), then
+ * let the utilities that follow win the specific properties they set
+ * (position, width, colors, ...). Previously this was reversed, so
+ * `all: initial` was clobbering `.fixed`'s position and `.w-72`'s width
+ * back to `static`/`auto` -- collapsing the overlay into a normal-flow
+ * block that stretched to the host page's full width.
  */
-@tailwind components;
-@tailwind utilities;
-
 :host,
 .signsync-root {
   all: initial;
   font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
   color-scheme: light;
 }
+
+@tailwind components;
+@tailwind utilities;
 
 .signsync-root * {
   box-sizing: border-box;
