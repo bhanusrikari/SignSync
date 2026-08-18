@@ -9,6 +9,7 @@
  * one hand's landmarks (the first detected hand -- see offscreen.ts).
  */
 import { CURL_CURLED_MIN, CURL_EXTENDED_MAX, MIN_GESTURE_CONFIDENCE } from "./gestureConstants";
+import { isCurled, isExtended } from "./gestureFeatures";
 import type {
   FingerCurlScores,
   FingerName,
@@ -46,11 +47,33 @@ function fingerMatchScore(curlScore: number, expected: FingerExpectation): numbe
   return Math.min(1, Math.max(0, (curlScore - CURL_CURLED_MIN) / (1 - CURL_CURLED_MIN)));
 }
 
+/** True if `curlScore` is confidently the OPPOSITE of `expected` -- e.g. a
+ *  finger expected "extended" that's actually confidently curled. Reuses
+ *  isExtended()/isCurled() (and thus the same centralized CURL_EXTENDED_MAX/
+ *  CURL_CURLED_MIN thresholds fingerMatchScore() already uses) -- no new or
+ *  duplicated thresholds. Merely ambiguous (dead-zone) curl scores are
+ *  neither confidently extended nor confidently curled, so this returns
+ *  false for them -- only a confidently-opposite finger counts. */
+function isConfidentlyOpposite(curlScore: number, expected: FingerExpectation): boolean {
+  if (expected === "extended") return isCurled(curlScore);
+  if (expected === "curled") return isExtended(curlScore);
+  return false; // "any" can never be contradicted
+}
+
 function templateMatchScore(curl: FingerCurlScores, template: GestureTemplate): number {
   const relevantFingers = (Object.keys(template) as FingerName[]).filter(
     (finger) => template[finger] !== "any",
   );
   if (relevantFingers.length === 0) return 0;
+
+  // A finger confidently in the opposite state disqualifies the whole
+  // template immediately, rather than being diluted into the average by
+  // the other fingers -- see gesture-robustness review.
+  const hasContradiction = relevantFingers.some((finger) =>
+    isConfidentlyOpposite(curl[finger], template[finger]),
+  );
+  if (hasContradiction) return 0;
+
   const total = relevantFingers.reduce(
     (sum, finger) => sum + fingerMatchScore(curl[finger], template[finger]),
     0,
