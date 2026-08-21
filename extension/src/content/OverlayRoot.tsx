@@ -3,7 +3,13 @@ import { Overlay } from "./Overlay";
 import { DEFAULT_STATE } from "@/shared/constants";
 import { sendToBackground } from "@/utils/messaging";
 import { speakText, stopSpeaking } from "@/services/speech";
-import type { GestureDetectedPayload, OverlayPosition, SignSyncMessage, SignSyncState } from "@/types";
+import type {
+  CaptionUpdatePayload,
+  GestureDetectedPayload,
+  OverlayPosition,
+  SignSyncMessage,
+  SignSyncState,
+} from "@/types";
 
 /** Bounded recent-gesture history shown in the overlay ("sentence" view).
  *  Session-only presentation state -- not persisted, not an AI-pipeline
@@ -15,6 +21,7 @@ export function OverlayRoot() {
   const [state, setState] = useState<SignSyncState>(DEFAULT_STATE);
   const [gesture, setGesture] = useState<GestureDetectedPayload | null>(null);
   const [history, setHistory] = useState<string[]>([]);
+  const [caption, setCaption] = useState<CaptionUpdatePayload | null>(null);
 
   useEffect(() => {
     sendToBackground<SignSyncState>({ type: "GET_STATE" }).then(setState);
@@ -34,6 +41,9 @@ export function OverlayRoot() {
         }
         // Speech Output turned off mid-utterance must stop immediately.
         if (!message.payload.speechOutput) stopSpeaking();
+        // Clear any stale caption the instant Live Captions turns off, so
+        // re-enabling never briefly shows a leftover transcript from before.
+        if (!(message.payload.enabled && message.payload.captions)) setCaption(null);
         return;
       }
       if (message.type === "GESTURE_DETECTED") {
@@ -46,6 +56,11 @@ export function OverlayRoot() {
           const text = message.payload.text;
           setHistory((prev) => [...prev, text].slice(-MAX_HISTORY));
         }
+        return;
+      }
+      if (message.type === "CAPTION_UPDATE") {
+        // Current-line-only for the MVP -- always replaced, no history.
+        setCaption(message.payload);
       }
     };
     chrome.runtime.onMessage.addListener(handleMessage);
@@ -86,6 +101,7 @@ export function OverlayRoot() {
       state={state}
       gesture={gesture}
       history={history}
+      caption={caption}
       onClearHistory={handleClearHistory}
       onDisable={handleDisable}
       onPositionChange={handlePositionChange}

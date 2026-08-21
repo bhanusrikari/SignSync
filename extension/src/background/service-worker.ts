@@ -12,12 +12,26 @@ async function applyAndBroadcast(
   const message: StateUpdatedMessage = { type: "STATE_UPDATED", payload: next };
   await broadcastToTabs(message);
 
-  const wasActive = previous.enabled && previous.gestureRecognition;
-  const isActive = next.enabled && next.gestureRecognition;
-  if (isActive && !wasActive) {
+  // Camera/MediaPipe and captions are independent capabilities that happen
+  // to share one offscreen document (Chrome allows only one per extension
+  // -- see ensureSharedOffscreenDocument()). Each gets its own start/stop
+  // transition check; the shared document itself is only created when
+  // either becomes needed and only destroyed when neither is (handled
+  // inside stopGestureCamera()/stopCaptions() via closeSharedOffscreenDocumentIfIdle()).
+  const wasCameraActive = previous.enabled && previous.gestureRecognition;
+  const isCameraActive = next.enabled && next.gestureRecognition;
+  if (isCameraActive && !wasCameraActive) {
     void startGestureCamera();
-  } else if (!isActive && wasActive) {
+  } else if (!isCameraActive && wasCameraActive) {
     void stopGestureCamera();
+  }
+
+  const wasCaptionsActive = previous.enabled && previous.captions;
+  const isCaptionsActive = next.enabled && next.captions;
+  if (isCaptionsActive && !wasCaptionsActive) {
+    void startCaptions();
+  } else if (!isCaptionsActive && wasCaptionsActive) {
+    void stopCaptions();
   }
 
   return next;
@@ -47,6 +61,12 @@ chrome.runtime.onMessage.addListener(
         broadcastToTabs(message).then(() => sendResponse({ ok: true }));
         return true;
 
+      case "CAPTION_UPDATE":
+        // Same required relay as GESTURE_DETECTED, for the live-captions
+        // pipeline's SpeechRecognition results.
+        broadcastToTabs(message).then(() => sendResponse({ ok: true }));
+        return true;
+
       default:
         return false;
     }
@@ -58,22 +78,32 @@ chrome.runtime.onInstalled.addListener(() => {
   getState();
 });
 
-// --- Gesture-recognition camera foundation -------------------------------
-// Camera permission/start/stop lifecycle only -- no MediaPipe/classification
-// wired in yet (see gesture-recognition plan). Triggered automatically by
-// the gestureRecognition toggle above; also exposed on globalThis for manual
-// testing from this service worker's DevTools console.
+// --- Offscreen document lifecycle (camera/gestures + live captions) -----
+// Both capabilities' permission/start/stop lifecycle, sharing one offscreen
+// document. Triggered automatically by the Gesture Recognition / Live
+// Captions toggles above; also exposed on globalThis for manual testing
+// from this service worker's DevTools console.
 
 const OFFSCREEN_URL = "offscreen.html";
 const PERMISSION_URL = "permission.html";
 
-/** Tab id of an open permission tab, if any -- avoids opening a second one
- *  while the user is still responding to the first. Reset on MV3 service
+/** Tab ids of open permission tabs, if any -- avoids opening a second one
+ *  of the same kind while the user is still responding to the first.
+ *  Camera and microphone are tracked separately since both can plausibly
+ *  be needed at once (e.g. enabling Accessibility for the first time with
+ *  both Gesture Recognition and Captions already on). Reset on MV3 service
  *  worker restart, which just means a fresh tab could be opened if the user
- *  re-triggers the flow; the stale tab (if still open) still works fine. */
-let permissionTabId: number | undefined;
+ *  re-triggers the flow; a stale tab (if still open) still works fine. */
+let cameraPermissionTabId: number | undefined;
+let microphonePermissionTabId: number | undefined;
 
-async function ensureGestureOffscreenDocument(): Promise<
+/** Creates the shared offscreen document (camera/MediaPipe AND captions
+ *  both live in it -- Chrome allows only one per extension) if it doesn't
+ *  already exist. Idempotent and safe to call from both capabilities'
+ *  start paths concurrently: if two callers race and Chrome rejects the
+ *  second createDocument() because the first already succeeded, that's
+ *  treated as success rather than a real failure. */
+async function ensureSharedOffscreenDocument(): Promise<
   { ok: true } | { ok: false; error: string }
 > {
   try {
@@ -81,15 +111,38 @@ async function ensureGestureOffscreenDocument(): Promise<
       await chrome.offscreen.createDocument({
         url: OFFSCREEN_URL,
         reasons: [chrome.offscreen.Reason.USER_MEDIA],
-        justification: "Camera access for SignSync gesture recognition.",
+        justification: "Camera access for SignSync gesture recognition and microphone access for live captions.",
       });
       console.log("[SignSync] offscreen document created");
     }
     return { ok: true };
   } catch (error) {
+    if (await chrome.offscreen.hasDocument()) return { ok: true }; // lost a creation race, not a real failure
     const message = error instanceof Error ? error.message : String(error);
     console.error("[SignSync] chrome.offscreen.createDocument failed:", error);
     return { ok: false, error: message };
+  }
+}
+
+/** Closes the shared offscreen document only if NEITHER capability that
+ *  depends on it is still supposed to be active -- re-reads persisted
+ *  state rather than trusting a snapshot, so this is correct even if
+ *  called from two concurrent stop paths (e.g. disabling Accessibility
+ *  while both Gesture Recognition and Captions were on). */
+async function closeSharedOffscreenDocumentIfIdle(): Promise<void> {
+  const state = await getState();
+  const cameraNeeded = state.enabled && state.gestureRecognition;
+  const captionsNeeded = state.enabled && state.captions;
+  if (cameraNeeded || captionsNeeded) {
+    console.log("[SignSync] offscreen document still needed by the other capability, keeping it alive");
+    return;
+  }
+  if (!(await chrome.offscreen.hasDocument())) return;
+  try {
+    await chrome.offscreen.closeDocument();
+    console.log("[SignSync] shared offscreen document closed (no capability needs it anymore)");
+  } catch (error) {
+    console.warn("[SignSync] closeDocument failed (possibly already closed):", error);
   }
 }
 
@@ -109,24 +162,29 @@ async function requestOffscreenCameraStart(): Promise<CameraDiagnostics | undefi
   }
 }
 
-async function openPermissionTab(): Promise<void> {
-  if (permissionTabId !== undefined) {
+/** Opens (or focuses an already-open) visible permission tab for the given
+ *  device kind. Camera and microphone are tracked as separate pending tabs
+ *  since both can legitimately be needed at once. */
+async function openPermissionTab(kind: "camera" | "microphone"): Promise<void> {
+  const existingTabId = kind === "microphone" ? microphonePermissionTabId : cameraPermissionTabId;
+  if (existingTabId !== undefined) {
     try {
-      await chrome.tabs.update(permissionTabId, { active: true });
+      await chrome.tabs.update(existingTabId, { active: true });
       return;
     } catch {
-      permissionTabId = undefined; // tab no longer exists
+      // tab no longer exists, fall through to open a fresh one
     }
   }
-  const tab = await chrome.tabs.create({ url: PERMISSION_URL });
-  permissionTabId = tab.id;
+  const tab = await chrome.tabs.create({ url: `${PERMISSION_URL}?kind=${kind}` });
+  if (kind === "microphone") microphonePermissionTabId = tab.id;
+  else cameraPermissionTabId = tab.id;
 }
 
 /** Enable path: try a silent camera start first (permission may already be
  *  granted from a previous session); only fall back to the interactive
  *  permission tab if that fails for a permission-shaped reason. */
 async function startGestureCamera(): Promise<void> {
-  const creation = await ensureGestureOffscreenDocument();
+  const creation = await ensureSharedOffscreenDocument();
   if (!creation.ok) return;
 
   const result = await requestOffscreenCameraStart();
@@ -144,7 +202,7 @@ async function startGestureCamera(): Promise<void> {
   }
 
   console.log("[SignSync] camera needs interactive permission, opening permission tab", result);
-  await openPermissionTab();
+  await openPermissionTab("camera");
 }
 
 async function stopGestureCamera(): Promise<void> {
@@ -154,8 +212,62 @@ async function stopGestureCamera(): Promise<void> {
   } catch (error) {
     console.warn("[SignSync] offscreen document did not respond to GESTURE_CAMERA_STOP:", error);
   }
-  await chrome.offscreen.closeDocument();
-  console.log("[SignSync] gesture camera stopped, offscreen document closed");
+  await closeSharedOffscreenDocumentIfIdle();
+}
+
+async function requestOffscreenCaptionsStart(): Promise<
+  { ok: boolean; status: string; errorMessage?: string } | undefined
+> {
+  try {
+    const result = (await chrome.runtime.sendMessage({ type: "CAPTIONS_START" })) as
+      | { ok: boolean; status: string; errorMessage?: string }
+      | undefined;
+    console.log("[SignSync] offscreen captions start result:", result);
+    return result;
+  } catch (error) {
+    console.error("[SignSync] offscreen document did not respond to CAPTIONS_START:", error);
+    return undefined;
+  }
+}
+
+/** Enable path for Live Captions -- same silent-first, permission-tab-
+ *  fallback shape as startGestureCamera(), but for the microphone and a
+ *  browser-support check instead of the camera. */
+async function startCaptions(): Promise<void> {
+  const creation = await ensureSharedOffscreenDocument();
+  if (!creation.ok) return;
+
+  const result = await requestOffscreenCaptionsStart();
+  if (result?.ok) {
+    console.log("[SignSync] captions active (permission already granted)");
+    return;
+  }
+
+  if (result?.status === "denied") {
+    console.warn(
+      "[SignSync] microphone permission previously denied -- not opening the permission tab " +
+        "automatically. The user must re-allow it via chrome://settings/content/microphone.",
+    );
+    return;
+  }
+
+  if (result?.status === "unsupported") {
+    console.warn("[SignSync] SpeechRecognition is not supported in this browser -- captions unavailable.");
+    return;
+  }
+
+  console.log("[SignSync] captions need interactive microphone permission, opening permission tab", result);
+  await openPermissionTab("microphone");
+}
+
+async function stopCaptions(): Promise<void> {
+  if (!(await chrome.offscreen.hasDocument())) return;
+  try {
+    await chrome.runtime.sendMessage({ type: "CAPTIONS_STOP" });
+  } catch (error) {
+    console.warn("[SignSync] offscreen document did not respond to CAPTIONS_STOP:", error);
+  }
+  await closeSharedOffscreenDocumentIfIdle();
 }
 
 // The permission tab reports its result here once the user has responded to
@@ -166,10 +278,10 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message?.type !== "CAMERA_PERMISSION_RESULT") return false;
 
   const result = message.payload as CameraDiagnostics;
-  console.log("[SignSync] permission tab reported:", result);
+  console.log("[SignSync] camera permission tab reported:", result);
 
-  if (sender.tab?.id !== undefined && sender.tab.id === permissionTabId) {
-    permissionTabId = undefined;
+  if (sender.tab?.id !== undefined && sender.tab.id === cameraPermissionTabId) {
+    cameraPermissionTabId = undefined;
   }
 
   if (result.ok) {
@@ -181,5 +293,25 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   return false;
 });
 
+// Same pattern as CAMERA_PERMISSION_RESULT above, for the microphone tab.
+chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  if (message?.type !== "MICROPHONE_PERMISSION_RESULT") return false;
+
+  const result = message.payload as CameraDiagnostics;
+  console.log("[SignSync] microphone permission tab reported:", result);
+
+  if (sender.tab?.id !== undefined && sender.tab.id === microphonePermissionTabId) {
+    microphonePermissionTabId = undefined;
+  }
+
+  if (result.ok) {
+    requestOffscreenCaptionsStart().then(sendResponse);
+    return true;
+  }
+
+  sendResponse({ acknowledged: true });
+  return false;
+});
+
 // Exposed for manual testing from this service worker's DevTools console.
-Object.assign(globalThis, { startGestureCamera, stopGestureCamera });
+Object.assign(globalThis, { startGestureCamera, stopGestureCamera, startCaptions, stopCaptions });
