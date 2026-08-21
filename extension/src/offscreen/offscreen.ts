@@ -17,6 +17,8 @@
 import { classifyCameraError, describeError } from "@/shared/camera";
 import type { CameraDiagnostics } from "@/shared/camera";
 import { classifySpeechRecognitionError } from "@/shared/speechRecognitionErrors";
+import { accumulateTranscript } from "@/shared/captionTranscript";
+import type { CaptionResultLike } from "@/shared/captionTranscript";
 import { detectHands, disposeHandTracker, isHandTrackerLoaded, loadHandTracker } from "@/ai/handTracker";
 import { extractHandFeatures } from "@/ai/gestureFeatures";
 import { RuleBasedGestureClassifier } from "@/ai/gestureClassifier";
@@ -224,6 +226,13 @@ function stopCamera(): { ok: true } {
 let captionsActive = false;
 let shouldRestartRecognition = false;
 let recognition: SpeechRecognition | null = null;
+/** Accumulated finalized transcript for the CURRENT captions session (see
+ *  accumulateTranscript() in shared/captionTranscript.ts). Persists across
+ *  automatic onend restarts below -- a new SpeechRecognition instance's own
+ *  results start over from index 0, but the session's finalized text must
+ *  not be lost when that happens. Reset only when startCaptions() begins a
+ *  genuinely new session, never by the automatic restart in onend. */
+let finalTranscript = "";
 
 function getSpeechRecognitionConstructor(): (new () => SpeechRecognition) | undefined {
   return window.SpeechRecognition ?? window.webkitSpeechRecognition;
@@ -250,11 +259,23 @@ function startRecognitionInstance(): void {
   instance.continuous = true;
   instance.interimResults = true;
 
+  // Scoped to THIS instance -- a fresh SpeechRecognition instance (e.g.
+  // after an automatic restart below) starts its own event.results back at
+  // index 0, so this must not carry over from a previous instance. The
+  // session-spanning accumulated text itself lives in finalTranscript
+  // above, which this deliberately does NOT reset.
+  let lastFinalizedIndex = -1;
+
   instance.onresult = (event) => {
-    const result = event.results[event.resultIndex];
-    const text = result?.[0]?.transcript;
-    if (!text) return;
-    sendCaptionUpdate(text, result.isFinal);
+    const results: CaptionResultLike[] = [];
+    for (let i = 0; i < event.results.length; i++) {
+      results.push({ isFinal: event.results[i].isFinal, transcript: event.results[i][0]?.transcript ?? "" });
+    }
+    const update = accumulateTranscript(finalTranscript, lastFinalizedIndex, results, event.resultIndex);
+    finalTranscript = update.finalTranscript;
+    lastFinalizedIndex = update.lastFinalizedIndex;
+    if (!update.combinedText) return;
+    sendCaptionUpdate(update.combinedText, update.isFinal);
   };
 
   instance.onerror = (event) => {
@@ -324,6 +345,10 @@ async function startCaptions(): Promise<{ ok: boolean; status: string; errorMess
     return { ok: false, status, errorMessage };
   }
 
+  // Only a genuinely new session (captions were off) starts a fresh
+  // transcript -- an already-active session calling this again (or a
+  // pipeline restart) must not wipe out text already accumulated.
+  if (!captionsActive) finalTranscript = "";
   captionsActive = true;
   shouldRestartRecognition = true;
   if (!recognition) startRecognitionInstance();
