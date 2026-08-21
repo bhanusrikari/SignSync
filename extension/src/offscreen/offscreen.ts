@@ -16,13 +16,14 @@
 
 import { classifyCameraError, describeError } from "@/shared/camera";
 import type { CameraDiagnostics } from "@/shared/camera";
+import { classifySpeechRecognitionError } from "@/shared/speechRecognitionErrors";
 import { detectHands, disposeHandTracker, isHandTrackerLoaded, loadHandTracker } from "@/ai/handTracker";
 import { extractHandFeatures } from "@/ai/gestureFeatures";
 import { RuleBasedGestureClassifier } from "@/ai/gestureClassifier";
 import { GestureStabilizer } from "@/ai/gestureStabilizer";
 import { mapToRecognizedGestureText } from "@/ai/gestureVocabulary";
 import type { GestureClassifier, StableGestureEvent } from "@/ai/gestureTypes";
-import type { GestureDetectedMessage } from "@/types";
+import type { CaptionUpdateMessage, GestureDetectedMessage } from "@/types";
 
 // Long-lived: constructed once, reused across every detection tick (and
 // across stop/start cycles -- reset() clears history, not the instances).
@@ -212,6 +213,130 @@ function stopCamera(): { ok: true } {
   return { ok: true };
 }
 
+// --- Live captions (SpeechRecognition) -----------------------------------
+// Independent capability sharing this same offscreen document with the
+// camera/MediaPipe pipeline above (Chrome allows only one offscreen
+// document per extension). Owns its own microphone capture + recognition
+// session; never touches activeStream, the hand tracker, the classifier,
+// or the stabilizer. Started/stopped by the background service worker via
+// CAPTIONS_START / CAPTIONS_STOP, in response to the Live Captions toggle.
+
+let captionsActive = false;
+let shouldRestartRecognition = false;
+let recognition: SpeechRecognition | null = null;
+
+function getSpeechRecognitionConstructor(): (new () => SpeechRecognition) | undefined {
+  return window.SpeechRecognition ?? window.webkitSpeechRecognition;
+}
+
+function sendCaptionUpdate(text: string, isFinal: boolean): void {
+  const message: CaptionUpdateMessage = {
+    type: "CAPTION_UPDATE",
+    payload: { text, isFinal, timestamp: Date.now() },
+  };
+  chrome.runtime.sendMessage(message).catch((error) => {
+    console.warn("[SignSync] failed to send CAPTION_UPDATE:", error);
+  });
+}
+
+/** Builds and starts one recognition session. Never call directly to
+ *  "restart" -- go through startCaptions()/the onend handler below so
+ *  captionsActive/shouldRestartRecognition stay authoritative. */
+function startRecognitionInstance(): void {
+  const SpeechRecognitionCtor = getSpeechRecognitionConstructor();
+  if (!SpeechRecognitionCtor) return; // support already checked by startCaptions()
+
+  const instance = new SpeechRecognitionCtor();
+  instance.continuous = true;
+  instance.interimResults = true;
+
+  instance.onresult = (event) => {
+    const result = event.results[event.resultIndex];
+    const text = result?.[0]?.transcript;
+    if (!text) return;
+    sendCaptionUpdate(text, result.isFinal);
+  };
+
+  instance.onerror = (event) => {
+    const status = classifySpeechRecognitionError(event.error);
+    console.warn(`[SignSync] SpeechRecognition error: ${event.error} (${status})`);
+    // Permission was revoked/denied, or the microphone itself is gone
+    // ("audio-capture" -> "no_microphone") -- don't keep retrying into the
+    // same wall on every onend; only an explicit CAPTIONS_START (the
+    // captions lifecycle being started again) re-arms restarting. "no-speech"
+    // and other transient errors are NOT fatal: onend still fires next and
+    // the restart logic below brings recognition back automatically as long
+    // as captions are active.
+    if (status === "denied" || status === "no_microphone") shouldRestartRecognition = false;
+  };
+
+  instance.onend = () => {
+    recognition = null;
+    if (captionsActive && shouldRestartRecognition) {
+      // Chrome can end a recognition session on its own (e.g. after a
+      // period of silence) even though captions are still logically
+      // enabled -- restart transparently so "live" captions stay live.
+      startRecognitionInstance();
+    }
+  };
+
+  try {
+    instance.start();
+    recognition = instance;
+  } catch (error) {
+    console.error("[SignSync] SpeechRecognition.start() failed:", error);
+    recognition = null;
+  }
+}
+
+function stopRecognitionInstance(): void {
+  if (!recognition) return;
+  // Detach handlers first so the onend this deliberate stop triggers is
+  // never mistaken for "recognition died unexpectedly, restart it".
+  recognition.onresult = null;
+  recognition.onerror = null;
+  recognition.onend = null;
+  recognition.stop();
+  recognition = null;
+}
+
+/**
+ * Establishes/verifies microphone permission (mirrors the camera
+ * permission check: getUserMedia's DOMException vocabulary is identical
+ * for audio and video, so classifyCameraError()/describeError() apply
+ * as-is -- no separate "audio permission" classifier needed). The
+ * throwaway stream is stopped immediately; the actual, ongoing capture is
+ * owned by the SpeechRecognition instance created afterward.
+ */
+async function startCaptions(): Promise<{ ok: boolean; status: string; errorMessage?: string }> {
+  if (!getSpeechRecognitionConstructor()) {
+    console.warn("[SignSync] SpeechRecognition is not supported in this context");
+    return { ok: false, status: "unsupported" };
+  }
+
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    stream.getTracks().forEach((track) => track.stop());
+  } catch (error) {
+    const { errorName, errorMessage } = describeError(error);
+    const status = classifyCameraError(errorName, errorMessage);
+    console.warn("[SignSync] microphone permission check failed:", errorName, errorMessage);
+    return { ok: false, status, errorMessage };
+  }
+
+  captionsActive = true;
+  shouldRestartRecognition = true;
+  if (!recognition) startRecognitionInstance();
+  return { ok: true, status: "granted" };
+}
+
+function stopCaptions(): { ok: true } {
+  captionsActive = false;
+  shouldRestartRecognition = false;
+  stopRecognitionInstance();
+  return { ok: true };
+}
+
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   if (message?.type === "GESTURE_CAMERA_START") {
     startCamera().then(sendResponse);
@@ -219,6 +344,14 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   }
   if (message?.type === "GESTURE_CAMERA_STOP") {
     sendResponse(stopCamera());
+    return false;
+  }
+  if (message?.type === "CAPTIONS_START") {
+    startCaptions().then(sendResponse);
+    return true; // async response
+  }
+  if (message?.type === "CAPTIONS_STOP") {
+    sendResponse(stopCaptions());
     return false;
   }
   return false;

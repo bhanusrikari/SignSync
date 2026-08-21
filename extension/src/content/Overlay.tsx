@@ -1,7 +1,7 @@
 import { useCallback, useRef, useState } from "react";
 import type { PointerEvent } from "react";
 import { Hand, Volume2, Captions, Settings, X, GripHorizontal } from "lucide-react";
-import type { GestureDetectedPayload, OverlayPosition, SignSyncState } from "@/types";
+import type { CaptionUpdatePayload, GestureDetectedPayload, OverlayPosition, SignSyncState } from "@/types";
 
 interface OverlayProps {
   state: SignSyncState;
@@ -11,6 +11,10 @@ interface OverlayProps {
   /** Recent recognized-gesture text, oldest first, bounded to MAX_HISTORY
    *  (see OverlayRoot.tsx). UNKNOWN gestures are never included. */
   history: string[];
+  /** Latest live-captions transcript chunk (interim or final), or null if
+   *  none has arrived yet (or captions are off/were just turned off).
+   *  Current-line-only for the MVP -- no caption history. */
+  caption: CaptionUpdatePayload | null;
   onClearHistory: () => void;
   onDisable: () => void;
   onPositionChange: (position: OverlayPosition) => void;
@@ -20,6 +24,7 @@ export function Overlay({
   state,
   gesture,
   history,
+  caption,
   onClearHistory,
   onDisable,
   onPositionChange,
@@ -76,6 +81,20 @@ export function Overlay({
   } else {
     primaryText = gesture.text ?? gesture.gesture.replace(/_/g, " ");
     secondaryText = `${gesture.gesture.replace(/_/g, " ")} · ${Math.round(gesture.confidence * 100)}%`;
+  }
+
+  // Same three-state shape as the gesture display above: feature off; no
+  // transcript yet; a live transcript, where an interim (not yet settled)
+  // result is styled distinctly from a final one.
+  let captionText: string;
+  let captionIsInterim = false;
+  if (!state.captions) {
+    captionText = "Captions off";
+  } else if (!caption) {
+    captionText = "Waiting for speech...";
+  } else {
+    captionText = caption.text;
+    captionIsInterim = !caption.isFinal;
   }
 
   return (
@@ -135,8 +154,8 @@ export function Overlay({
 
         <div className="flex items-center gap-2 text-slate-600">
           <Captions className="h-4 w-4 shrink-0 text-slate-400" />
-          <span className="truncate">
-            {state.captions ? "Waiting for speech..." : "Captions off"}
+          <span className={`truncate ${captionIsInterim ? "italic text-slate-400" : ""}`}>
+            {captionText}
           </span>
         </div>
 

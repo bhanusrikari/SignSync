@@ -28,7 +28,8 @@ export type MessageType =
   | "SET_ENABLED"
   | "UPDATE_SETTINGS"
   | "STATE_UPDATED"
-  | "GESTURE_DETECTED";
+  | "GESTURE_DETECTED"
+  | "CAPTION_UPDATE";
 
 export interface GetStateMessage {
   type: "GET_STATE";
@@ -74,14 +75,36 @@ export interface GestureDetectedMessage {
   payload: GestureDetectedPayload;
 }
 
+export interface CaptionUpdatePayload {
+  /** Current transcript chunk -- interim (still being refined) or final. */
+  text: string;
+  isFinal: boolean;
+  timestamp: number;
+}
+
+/**
+ * Broadcast from the background worker whenever the live-captions pipeline
+ * (offscreen document's SpeechRecognition instance) produces a result --
+ * one message per recognition result, interim or final. This is a
+ * transcript of ambient/microphone speech (live captions), distinct from
+ * GESTURE_DETECTED's gesture-to-text output and from the existing TTS
+ * (speechSynthesis) speech *output* -- three separate capabilities that
+ * happen to share similar names.
+ */
+export interface CaptionUpdateMessage {
+  type: "CAPTION_UPDATE";
+  payload: CaptionUpdatePayload;
+}
+
 export type SignSyncMessage =
   | GetStateMessage
   | SetEnabledMessage
   | UpdateSettingsMessage
   | StateUpdatedMessage
-  | GestureDetectedMessage;
+  | GestureDetectedMessage
+  | CaptionUpdateMessage;
 
 /** Messages the background worker broadcasts to every tab's content script,
  *  as opposed to request/response messages a popup or content script sends
  *  TO the background worker. */
-export type BroadcastMessage = StateUpdatedMessage | GestureDetectedMessage;
+export type BroadcastMessage = StateUpdatedMessage | GestureDetectedMessage | CaptionUpdateMessage;
