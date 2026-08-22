@@ -6,7 +6,7 @@
   "scripts": {
     "dev": "vite",
     "typecheck": "tsc --noEmit",
-    "build": "npm run typecheck && vite build --config vite.config.ts && vite build --config vite.background.config.ts && vite build --config vite.content.config.ts && vite build --config vite.offscreen.config.ts && vite build --config vite.permission.config.ts",
+    "build": "npm run typecheck && vite build --config vite.config.ts && vite build --config vite.background.config.ts && vite build --config vite.content.config.ts && vite build --config vite.offscreen.config.ts && vite build --config vite.permission.config.ts && vite build --config vite.record.config.ts && vite build --config vite.validate.config.ts && vite build --config vite.tutorials.config.ts",
     "lint": "eslint . --ext ts,tsx --max-warnings 0",
     "test": "vitest run"
   },

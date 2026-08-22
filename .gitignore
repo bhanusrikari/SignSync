@@ -7,6 +7,7 @@ dist/
 extension/dist/
 build/
 out/
+coverage/
 
 # Environment variables
 .env
@@ -18,6 +19,7 @@ out/
 *.env.local
 
 # Logs
+*.log
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
@@ -36,3 +38,9 @@ lerna-debug.log*
 # OS metadata
 .DS_Store
 Thumbs.db
+
+# Real personalized-gesture hand-landmark exports (see extension/real-data/README.md)
+# -- this is real, personally captured biometric-adjacent hand geometry,
+# never committed. The directory's README.md (instructions) stays trackable;
+# only the data files themselves are ignored.
+extension/real-data/*.json

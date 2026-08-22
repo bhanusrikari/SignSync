@@ -22,13 +22,229 @@ import { extractHandFeatures } from "@/ai/gestureFeatures";
 import { RuleBasedGestureClassifier } from "@/ai/gestureClassifier";
 import { GestureStabilizer } from "@/ai/gestureStabilizer";
 import { mapToRecognizedGestureText } from "@/ai/gestureVocabulary";
+import { matchPersonalizedGestureRotationInvariant } from "@/ai/personalizedGestureRotation";
+import { MAX_ACCEPTABLE_DISTANCE, MIN_MATCH_CONFIDENCE } from "@/ai/personalizedGestureMatcher";
+import type { PersonalizedGestureMatchResult } from "@/ai/personalizedGestureMatcher";
+import { PersonalizedGestureStabilizer } from "@/ai/personalizedGestureStabilizer";
+import type { PersonalizedStableGestureEvent } from "@/ai/personalizedGestureStabilizer";
+import { getPersonalizedGestures } from "@/services/personalizedGestures";
+import { resolvePersonalizedGestureMeaning } from "@/shared/personalizedGestures";
+import { DB_NAME, DB_VERSION, GESTURES_STORE } from "@/services/personalizedGesturesDb";
+import { RefreshablePersonalizedGesturesLoader } from "./personalizedGesturesLoader";
+import { personalizedDebug } from "./personalizedDebug";
 import type { GestureClassifier, StableGestureEvent } from "@/ai/gestureTypes";
-import type { CaptionUpdateMessage, GestureDetectedMessage } from "@/types";
+import type {
+  CaptionUpdateMessage,
+  GestureDetectedMessage,
+  LanguageCode,
+  PersonalizedGestureDetectedMessage,
+} from "@/types";
 
 // Long-lived: constructed once, reused across every detection tick (and
 // across stop/start cycles -- reset() clears history, not the instances).
 const gestureClassifier: GestureClassifier = new RuleBasedGestureClassifier();
 const gestureStabilizer = new GestureStabilizer();
+
+// Personalized gesture recognition (Phase 9): an entirely independent,
+// PARALLEL detection path -- see personalizedGestureMatcher.ts's header.
+// Never calls, replaces, or is called by gestureClassifier/gestureStabilizer
+// above. Same per-frame landmarks, same detection tick, separate outcome.
+const personalizedGestureStabilizer = new PersonalizedGestureStabilizer();
+
+/** Owns the enabled personalized gestures used by live matching (Phase 9.1
+ *  fix, see personalizedGesturesLoader.ts for the full rationale). Its
+ *  get() is what the per-frame detection loop reads -- synchronous,
+ *  side-effect-free, never touches IndexedDB -- while reload() (called from
+ *  loadPersonalizedGestures() below) is what performs the actual fetch, on
+ *  every recognition activation, not only the first one in this document's
+ *  lifetime (Phase 9 Step 13: no DB operations in the frame loop itself). */
+const personalizedGesturesLoader = new RefreshablePersonalizedGesturesLoader(async () => {
+  const gestures = await getPersonalizedGestures();
+  return gestures.filter((gesture) => gesture.enabled);
+});
+
+/** Loader status not owned by RefreshablePersonalizedGesturesLoader itself
+ *  (it only tracks the list, not "is a reload currently in flight" / "when
+ *  did one last succeed") -- tracked here purely for [PERS] LOADER
+ *  diagnostics, read by no production matching logic. */
+let personalizedGesturesLoading = false;
+let personalizedGesturesLastSuccessAt: number | null = null;
+
+/** Interface language to resolve a personalized gesture's localized
+ *  meaning in (Phase 11 Part B) -- set from GESTURE_CAMERA_START's payload
+ *  and kept current via GESTURE_LANGUAGE_UPDATE (see the message listener
+ *  below), mirroring captionLanguage's role for the captions pipeline.
+ *  Defaults to "en-IN" only so this module never resolves against an
+ *  empty language before the first GESTURE_CAMERA_START arrives. Read only
+ *  by handleStablePersonalizedGestureEvent() -- never touches matching,
+ *  which is entirely language-agnostic (landmarks, not text). */
+let gestureLanguage: LanguageCode = "en-IN";
+
+function logPersonalizedLoaderState(): void {
+  const gestures = personalizedGesturesLoader.get();
+  personalizedDebug.loader({
+    loaded: personalizedGesturesLastSuccessAt !== null,
+    loading: personalizedGesturesLoading,
+    lastSuccessAt: personalizedGesturesLastSuccessAt,
+    count: gestures.length,
+    ids: gestures.map((gesture) => gesture.id),
+  });
+}
+
+/** Triggers a fresh reload via personalizedGesturesLoader. Called from
+ *  startCamera() on EVERY activation (Phase 9.1 fix) -- previously this only
+ *  ran when the hand tracker was first loaded, so a gesture recorded or
+ *  merged in record.html/validate.html (separate documents/tabs writing
+ *  straight to IndexedDB) was invisible to an already-running offscreen
+ *  document's live matching until Gesture Recognition was toggled off and
+ *  back on. */
+async function loadPersonalizedGestures(): Promise<void> {
+  personalizedGesturesLoading = true;
+  logPersonalizedLoaderState(); // "loading" visible before the fetch settles
+  try {
+    const gestures = await personalizedGesturesLoader.reload();
+    personalizedGesturesLastSuccessAt = Date.now();
+    console.log(`[SignSync] loaded ${gestures.length} enabled personalized gesture(s)`);
+    // Proves (every activation, not just once) that THIS offscreen document
+    // is reading the exact same SignSyncDB/personalizedGestures store that
+    // record.html/validate.html write to -- see personalizedGesturesDb.ts,
+    // the single source of these constants everywhere in the codebase.
+    personalizedDebug.db({
+      dbName: DB_NAME,
+      dbVersion: DB_VERSION,
+      storeName: GESTURES_STORE,
+      count: gestures.length,
+      ids: gestures.map((gesture) => gesture.id),
+      names: gestures.map((gesture) => gesture.name),
+      exampleCounts: gestures.map((gesture) => gesture.examples.length),
+    });
+  } catch (error) {
+    // RefreshablePersonalizedGesturesLoader.reload() never actually throws
+    // (see its own doc comment) -- this catch exists only so a future
+    // change to that contract can never silently crash hand tracking here.
+    personalizedDebug.error("loadPersonalizedGestures", error);
+  } finally {
+    personalizedGesturesLoading = false;
+    logPersonalizedLoaderState();
+  }
+}
+
+/** Per-hand-detected-frame personalized diagnostics: candidate summary, the
+ *  match decision with an inferred reason, and the stabilizer transition.
+ *  Called once per hand-detected tick -- never on a per-frame timer -- and
+ *  every branch here is read-only observation of values the production
+ *  matching/stabilization code already computed; nothing here can change
+ *  the outcome. */
+function logPersonalizedFrame(
+  match: PersonalizedGestureMatchResult,
+  stableEvent: PersonalizedStableGestureEvent | null,
+): void {
+  const gestures = personalizedGesturesLoader.get();
+  personalizedDebug.frame({
+    handDetected: true,
+    gestureCount: gestures.length,
+    candidateIds: gestures.map((gesture) => gesture.id),
+  });
+
+  if (match.matched && match.gestureId && match.name) {
+    personalizedDebug.matchAccepted({
+      id: match.gestureId,
+      name: match.name,
+      distance: match.distance,
+      confidence: match.confidence,
+      threshold: MAX_ACCEPTABLE_DISTANCE,
+    });
+  } else {
+    // Inferred reason, for diagnostics only -- reads the SAME already-
+    // exported threshold constants the matcher itself uses (never
+    // duplicated/reimplemented logic), so this can never disagree with the
+    // matcher's actual decision.
+    let reason: string;
+    if (gestures.length === 0) {
+      reason = "no personalized gestures loaded";
+    } else if (!Number.isFinite(match.distance)) {
+      reason = "no usable candidate example (all malformed or contradicted)";
+    } else if (match.distance > MAX_ACCEPTABLE_DISTANCE) {
+      reason = "distance exceeds MAX_ACCEPTABLE_DISTANCE";
+    } else if (match.confidence < MIN_MATCH_CONFIDENCE) {
+      reason = "confidence below MIN_MATCH_CONFIDENCE";
+    } else {
+      reason = "ambiguous (within AMBIGUITY_MARGIN of the second-best candidate)";
+    }
+    personalizedDebug.matchRejected({
+      reason,
+      bestId: match.gestureId,
+      bestName: match.name,
+      distance: match.distance,
+      confidence: match.confidence,
+      threshold: MAX_ACCEPTABLE_DISTANCE,
+    });
+  }
+
+  const snapshot = personalizedGestureStabilizer.getDebugSnapshot();
+  personalizedDebug.stabilizer({
+    incomingId: match.matched ? match.gestureId : null,
+    window: snapshot.window,
+    stableId: snapshot.stableId,
+    emitted: stableEvent !== null,
+  });
+}
+
+/** Called once per STABLE personalized-gesture transition (never per
+ *  detection frame -- see PersonalizedGestureStabilizer). Logs for local
+ *  diagnostics and relays a PERSONALIZED_GESTURE_DETECTED message through
+ *  the background worker, exactly like handleStableGestureEvent() does for
+ *  the built-in pipeline -- same required relay, same "never let a delivery
+ *  failure stop hand tracking" swallow-and-warn behavior.
+ *
+ *  Phase 11 Part B: `event.meaning` (from PersonalizedGestureMatchResult,
+ *  the protected matcher's own always-English gesture.meaning) is re-
+ *  resolved here against the full PersonalizedGesture record's
+ *  localizedMeanings for the current gestureLanguage before being sent --
+ *  a presentation-layer override, not a matcher change. The matcher/
+ *  stabilizer/rotation files are never touched; this only changes which
+ *  text gets put in the OUTGOING message after they've already decided
+ *  which gesture matched. */
+function handleStablePersonalizedGestureEvent(event: PersonalizedStableGestureEvent): void {
+  console.log(
+    `[SignSync] Personalized gesture detected:\nname=${event.name}\ngestureId=${event.gestureId}\n` +
+      `confidence=${event.confidence.toFixed(2)}\ndistance=${event.distance.toFixed(4)}`,
+  );
+
+  const localizedMeaning = resolvePersonalizedGestureMeaning(
+    personalizedGesturesLoader.get(),
+    event.gestureId,
+    event.meaning,
+    gestureLanguage,
+  );
+
+  const message: PersonalizedGestureDetectedMessage = {
+    type: "PERSONALIZED_GESTURE_DETECTED",
+    payload: {
+      gestureId: event.gestureId,
+      name: event.name,
+      meaning: localizedMeaning,
+      language: gestureLanguage,
+      confidence: event.confidence,
+      distance: event.distance,
+      timestamp: event.timestamp,
+    },
+  };
+  personalizedDebug.message({ sent: true, type: message.type, gestureId: event.gestureId });
+  chrome.runtime.sendMessage(message).catch((error) => {
+    console.warn("[SignSync] failed to send PERSONALIZED_GESTURE_DETECTED:", error);
+    personalizedDebug.message({ sent: false, type: message.type, gestureId: event.gestureId });
+  });
+}
+
+const NO_PERSONALIZED_MATCH: PersonalizedGestureMatchResult = {
+  gestureId: null,
+  name: null,
+  meaning: null,
+  confidence: 0,
+  distance: Infinity,
+  matched: false,
+};
 
 /**
  * Called once per STABLE gesture transition (never per detection frame --
@@ -64,6 +280,11 @@ const DETECTION_INTERVAL_MS = 120;
 
 let activeStream: MediaStream | null = null;
 let detectionTimer: number | undefined;
+/** Tracks whether the PREVIOUS tick had a hand in frame, purely so the
+ *  "[SignSync] hand detected" / "no hand detected" console lines below log
+ *  only on a transition instead of every ~120ms tick (Phase 9.3 cleanup).
+ *  null before the first tick, so the very first tick always logs once. */
+let lastHandPresence: boolean | null = null;
 
 const statusEl = document.getElementById("status");
 const videoEl = document.getElementById("preview") as HTMLVideoElement | null;
@@ -96,6 +317,14 @@ async function startHandTracking(): Promise<void> {
     return;
   }
 
+  // Loaded here for the FIRST activation (cold start, before the frame loop
+  // below exists yet); startCamera()'s "already active" branch (Phase 9.1
+  // fix) covers every later activation. Always a one-off read outside the
+  // frame loop itself (Phase 9 Step 13) -- a slow/failed load here never
+  // blocks or crashes hand tracking, it just means personalized recognition
+  // sits out this session.
+  await loadPersonalizedGestures();
+
   await waitForVideoReady(videoEl);
   setStatus("Hand tracking active");
 
@@ -109,25 +338,55 @@ async function startHandTracking(): Promise<void> {
         // is currently the only hand present, but the choice is documented
         // explicitly since nothing here assumes that stays true forever.
         const handLandmarks = result.landmarks[0];
-        const wrist = handLandmarks[0];
-        console.log(
-          `[SignSync] hand detected: ${result.handsDetected} hand(s), ` +
-            `21 landmarks each. wrist=(${wrist.x.toFixed(3)}, ${wrist.y.toFixed(3)}, ${wrist.z.toFixed(3)})`,
-        );
+        // Logged only on the no-hand -> hand-detected TRANSITION (Phase 9.3
+        // cleanup) -- this used to fire on every single tick (~8/sec) for as
+        // long as a hand stayed in frame, drowning out everything else in
+        // the console. setStatus() below still updates the visible status
+        // text every tick regardless; only the console spam is throttled.
+        if (lastHandPresence !== true) {
+          console.log(`[SignSync] hand detected: ${result.handsDetected} hand(s), 21 landmarks each`);
+        }
+        lastHandPresence = true;
         setStatus(`Hand detected (${result.handsDetected})`);
 
         const features = extractHandFeatures(handLandmarks);
+
         const classification = gestureClassifier.classify(features);
         const stableEvent = gestureStabilizer.push(classification, Date.now());
         if (stableEvent) handleStableGestureEvent(stableEvent);
+
+        // Independent personalized path: same already-extracted
+        // normalizedLandmarks, the rotation-invariant matcher (validated
+        // against 54 real examples -- see the Phase 8.6 report), and its own
+        // stabilizer. Never influences, and is never influenced by, the
+        // built-in classification/stabilization above.
+        const personalizedMatch = matchPersonalizedGestureRotationInvariant(
+          features.normalizedLandmarks,
+          personalizedGesturesLoader.get(),
+        );
+        const personalizedStableEvent = personalizedGestureStabilizer.push(personalizedMatch, Date.now());
+        if (personalizedStableEvent) handleStablePersonalizedGestureEvent(personalizedStableEvent);
+        logPersonalizedFrame(personalizedMatch, personalizedStableEvent);
       } else {
-        console.log("[SignSync] no hand detected");
+        if (lastHandPresence !== false) {
+          console.log("[SignSync] no hand detected");
+        }
+        lastHandPresence = false;
         setStatus("No hand detected");
 
         // Feed an UNKNOWN frame so a previously-stable gesture correctly
         // decays once the hand leaves the frame, instead of staying stuck.
         const stableEvent = gestureStabilizer.push({ gesture: "UNKNOWN", confidence: 0 }, Date.now());
         if (stableEvent) handleStableGestureEvent(stableEvent);
+
+        // Same decay for the personalized path -- no event is ever emitted
+        // for a transition to "no match" (see personalizedGestureStabilizer.ts),
+        // this call only resets internal state so a later re-match fires
+        // again. Not logged (Phase 3: personalized diagnostics are only
+        // meaningful "when a hand exists") -- the stabilizer reset itself
+        // still happens either way, only the [PERS] console output is
+        // skipped here.
+        personalizedGestureStabilizer.push(NO_PERSONALIZED_MATCH, Date.now());
       }
     } catch (error) {
       console.error("[SignSync] gesture pipeline tick failed:", error);
@@ -140,8 +399,10 @@ function stopHandTracking(): void {
     clearInterval(detectionTimer);
     detectionTimer = undefined;
   }
+  lastHandPresence = null;
   disposeHandTracker();
   gestureStabilizer.reset();
+  personalizedGestureStabilizer.reset();
 }
 
 async function startCamera(): Promise<CameraDiagnostics> {
@@ -153,6 +414,14 @@ async function startCamera(): Promise<CameraDiagnostics> {
 
   if (activeStream) {
     setStatus("Camera already active");
+    // Phase 9.1 fix: refresh personalized gestures on EVERY activation, even
+    // when the hand tracker (and its detection loop) are already running --
+    // awaited so the loop's very next tick reads the refreshed list, not
+    // several frames later. This is the exact path that was previously
+    // skipped whenever isHandTrackerLoaded() was already true, leaving a
+    // stale (often empty) personalizedGestures snapshot for the rest of the
+    // session. Still a single one-off read here, never a per-frame one.
+    await loadPersonalizedGestures();
     if (!isHandTrackerLoaded()) void startHandTracking();
     return { ok: true, status: "granted", mediaDevicesExists };
   }
@@ -224,15 +493,28 @@ function stopCamera(): { ok: true } {
 let captionsActive = false;
 let shouldRestartRecognition = false;
 let recognition: SpeechRecognition | null = null;
+/** Language the CURRENT (or next) recognition session should use (Phase 10
+ *  Part 8) -- set by startCaptions()'s caller, read by
+ *  startRecognitionInstance() every time it builds a new instance, including
+ *  the onend-triggered auto-restart path, which doesn't otherwise know the
+ *  language at all. Defaults to "en-IN" only so this module never
+ *  constructs an instance with an empty .lang before the first
+ *  CAPTIONS_START arrives. */
+let captionLanguage: LanguageCode = "en-IN";
 
 function getSpeechRecognitionConstructor(): (new () => SpeechRecognition) | undefined {
   return window.SpeechRecognition ?? window.webkitSpeechRecognition;
 }
 
-function sendCaptionUpdate(text: string, isFinal: boolean): void {
+function sendCaptionUpdate(
+  text: string,
+  isFinal: boolean,
+  unsupported = false,
+  unsupportedReason?: "language" | "browser" | "permission",
+): void {
   const message: CaptionUpdateMessage = {
     type: "CAPTION_UPDATE",
-    payload: { text, isFinal, timestamp: Date.now() },
+    payload: { text, isFinal, timestamp: Date.now(), unsupported, unsupportedReason },
   };
   chrome.runtime.sendMessage(message).catch((error) => {
     console.warn("[SignSync] failed to send CAPTION_UPDATE:", error);
@@ -249,6 +531,7 @@ function startRecognitionInstance(): void {
   const instance = new SpeechRecognitionCtor();
   instance.continuous = true;
   instance.interimResults = true;
+  instance.lang = captionLanguage;
 
   instance.onresult = (event) => {
     const result = event.results[event.resultIndex];
@@ -267,7 +550,22 @@ function startRecognitionInstance(): void {
     // and other transient errors are NOT fatal: onend still fires next and
     // the restart logic below brings recognition back automatically as long
     // as captions are active.
-    if (status === "denied" || status === "no_microphone") shouldRestartRecognition = false;
+    if (status === "denied" || status === "no_microphone") {
+      // Phase 11 Part C: mic access can be revoked or the device can
+      // disappear WHILE captions are already running, not just at the
+      // initial permission check -- without this, the overlay would just
+      // silently stop updating with no explanation at all.
+      shouldRestartRecognition = false;
+      sendCaptionUpdate("", false, true, "permission");
+    }
+    if (status === "language_not_supported") {
+      // Phase 10 Part 8: never expose the raw SpeechRecognition error to
+      // the user, and never keep retrying into a language the browser has
+      // already said it cannot recognize -- tell the content script once,
+      // clearly, via the SAME channel captions already use.
+      shouldRestartRecognition = false;
+      sendCaptionUpdate("", false, true, "language");
+    }
   };
 
   instance.onend = () => {
@@ -308,9 +606,14 @@ function stopRecognitionInstance(): void {
  * throwaway stream is stopped immediately; the actual, ongoing capture is
  * owned by the SpeechRecognition instance created afterward.
  */
-async function startCaptions(): Promise<{ ok: boolean; status: string; errorMessage?: string }> {
+async function startCaptions(language: LanguageCode): Promise<{ ok: boolean; status: string; errorMessage?: string }> {
+  captionLanguage = language;
   if (!getSpeechRecognitionConstructor()) {
     console.warn("[SignSync] SpeechRecognition is not supported in this context");
+    // Phase 11 Part C: previously this left the overlay stuck on "Waiting
+    // for speech..." forever with no explanation -- now it tells the user
+    // plainly, through the same channel every other caption message uses.
+    sendCaptionUpdate("", false, true, "browser");
     return { ok: false, status: "unsupported" };
   }
 
@@ -321,6 +624,15 @@ async function startCaptions(): Promise<{ ok: boolean; status: string; errorMess
     const { errorName, errorMessage } = describeError(error);
     const status = classifyCameraError(errorName, errorMessage);
     console.warn("[SignSync] microphone permission check failed:", errorName, errorMessage);
+    // Phase 11 Part C: "denied" is the one status the service worker
+    // itself treats as final (see startCaptions() there) -- every other
+    // status still falls through to opening the interactive permission
+    // tab, so only "denied" gets an immediate friendly overlay message
+    // here; the others resolve (or don't) once the user responds to that
+    // tab, same as before this change.
+    if (status === "denied") {
+      sendCaptionUpdate("", false, true, "permission");
+    }
     return { ok: false, status, errorMessage };
   }
 
@@ -339,6 +651,12 @@ function stopCaptions(): { ok: true } {
 
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   if (message?.type === "GESTURE_CAMERA_START") {
+    // Phase 11 Part B: GESTURE_CAMERA_START now carries the interface
+    // language (mirroring CAPTIONS_START's `language` payload below) so
+    // personalized-gesture meanings can be resolved in it from the very
+    // first activation -- falls back to "en-IN" for the same
+    // never-silently-undefined reason CAPTIONS_START does.
+    gestureLanguage = message.payload?.language ?? "en-IN";
     startCamera().then(sendResponse);
     return true; // async response
   }
@@ -346,8 +664,24 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     sendResponse(stopCamera());
     return false;
   }
+  if (message?.type === "GESTURE_LANGUAGE_UPDATE") {
+    // Sent whenever SignSyncState.language changes while gesture
+    // recognition is already active (Phase 11 Part B) -- unlike captions,
+    // this never needs a restart: it's a plain module variable read at
+    // the moment a stable personalized match is about to be sent, not a
+    // SpeechRecognition instance property that only takes effect on
+    // (re)construction.
+    gestureLanguage = message.payload?.language ?? gestureLanguage;
+    sendResponse({ ok: true });
+    return false;
+  }
   if (message?.type === "CAPTIONS_START") {
-    startCaptions().then(sendResponse);
+    // Phase 10 Part 8: CAPTIONS_START now always carries the caption
+    // language the service worker resolved from SignSyncState -- falls
+    // back to "en-IN" only if a caller somehow omits it (e.g. an older
+    // cached message shape), never silently undefined.
+    const language: LanguageCode = message.payload?.language ?? "en-IN";
+    startCaptions(language).then(sendResponse);
     return true; // async response
   }
   if (message?.type === "CAPTIONS_STOP") {

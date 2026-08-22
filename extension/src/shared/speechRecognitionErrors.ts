@@ -18,6 +18,7 @@ export type SpeechRecognitionResultStatus =
   | "network_error"
   | "aborted"
   | "unsupported"
+  | "language_not_supported"
   | "error";
 
 export interface SpeechRecognitionDiagnostics {
@@ -47,6 +48,13 @@ export function classifySpeechRecognitionError(errorCode: string): SpeechRecogni
       return "network_error";
     case "aborted":
       return "aborted";
+    case "language-not-supported":
+      // Phase 10 Part 8: the browser recognized the request but cannot run
+      // SpeechRecognition in the requested language -- distinct from a
+      // generic "error" so the UI can show a clear, specific message
+      // ("Live captions are unavailable for this language in your
+      // browser.") instead of a raw technical error.
+      return "language_not_supported";
     default:
       return "error";
   }
