@@ -15,6 +15,11 @@ export const DEFAULT_STATE: SignSyncState = {
   speechRecognition: false,
   language: "en-IN",
   overlayPosition: { x: 24, y: 24 },
+  highContrast: false,
+  largeText: false,
+  reducedMotion: false,
+  hasSeenOnboarding: false,
+  developerDiagnostics: false,
 };
 
 /** Key used for the single SignSyncState record in chrome.storage.local. */

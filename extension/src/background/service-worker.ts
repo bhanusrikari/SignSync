@@ -1,6 +1,6 @@
 import { getState, updateState } from "@/services/storage";
 import { broadcastToTabs } from "@/utils/messaging";
-import type { SignSyncMessage, SignSyncState, StateUpdatedMessage } from "@/types";
+import type { LanguageCode, SignSyncMessage, SignSyncState, StateUpdatedMessage } from "@/types";
 import type { CameraDiagnostics } from "@/shared/camera";
 
 /** Persists `partial`, then relays the resulting state to every tab's content script. */
@@ -21,17 +21,29 @@ async function applyAndBroadcast(
   const wasCameraActive = previous.enabled && previous.gestureRecognition;
   const isCameraActive = next.enabled && next.gestureRecognition;
   if (isCameraActive && !wasCameraActive) {
-    void startGestureCamera();
+    void startGestureCamera(next.language);
   } else if (!isCameraActive && wasCameraActive) {
     void stopGestureCamera();
+  } else if (isCameraActive && wasCameraActive && next.language !== previous.language) {
+    // Phase 11 Part B: unlike captions, personalized-gesture recognition
+    // doesn't need a restart to pick up a language change -- the offscreen
+    // document just needs its gestureLanguage variable updated so the
+    // NEXT stable match resolves against the new language.
+    void requestOffscreenGestureLanguageUpdate(next.language);
   }
 
   const wasCaptionsActive = previous.enabled && previous.captions;
   const isCaptionsActive = next.enabled && next.captions;
   if (isCaptionsActive && !wasCaptionsActive) {
-    void startCaptions();
+    void startCaptions(next.language);
   } else if (!isCaptionsActive && wasCaptionsActive) {
     void stopCaptions();
+  } else if (isCaptionsActive && wasCaptionsActive && next.language !== previous.language) {
+    // Phase 10 Part 8: a running SpeechRecognition session doesn't pick up
+    // a new .lang on its own -- restart it so changing the caption language
+    // while captions are already on actually takes effect, not just on the
+    // next captions off->on toggle.
+    void stopCaptions().then(() => startCaptions(next.language));
   }
 
   return next;
@@ -58,6 +70,12 @@ chrome.runtime.onMessage.addListener(
         // can, which needs tab ids the offscreen document doesn't have. The
         // background worker is the one context that can enumerate tabs, so
         // it's a required relay here, not optional forwarding.
+        broadcastToTabs(message).then(() => sendResponse({ ok: true }));
+        return true;
+
+      case "PERSONALIZED_GESTURE_DETECTED":
+        // Same required relay as GESTURE_DETECTED, for the independent
+        // personalized-gesture detection path (Phase 9).
         broadcastToTabs(message).then(() => sendResponse({ ok: true }));
         return true;
 
@@ -146,10 +164,11 @@ async function closeSharedOffscreenDocumentIfIdle(): Promise<void> {
   }
 }
 
-async function requestOffscreenCameraStart(): Promise<CameraDiagnostics | undefined> {
+async function requestOffscreenCameraStart(language: LanguageCode): Promise<CameraDiagnostics | undefined> {
   try {
     const result = (await chrome.runtime.sendMessage({
       type: "GESTURE_CAMERA_START",
+      payload: { language },
     })) as CameraDiagnostics | undefined;
     console.log("[SignSync] offscreen camera start result:", result);
     return result;
@@ -159,6 +178,20 @@ async function requestOffscreenCameraStart(): Promise<CameraDiagnostics | undefi
       error,
     );
     return undefined;
+  }
+}
+
+/** Updates the offscreen document's gestureLanguage without restarting the
+ *  camera/hand-tracking loop (Phase 11 Part B) -- called when the
+ *  interface language changes while gesture recognition is already active.
+ *  Swallowed-and-logged like every other offscreen relay here: a failed
+ *  update just means the next personalized-gesture meaning resolves in the
+ *  previous language until the document is next reached, never a crash. */
+async function requestOffscreenGestureLanguageUpdate(language: LanguageCode): Promise<void> {
+  try {
+    await chrome.runtime.sendMessage({ type: "GESTURE_LANGUAGE_UPDATE", payload: { language } });
+  } catch (error) {
+    console.warn("[SignSync] offscreen document did not respond to GESTURE_LANGUAGE_UPDATE:", error);
   }
 }
 
@@ -183,11 +216,11 @@ async function openPermissionTab(kind: "camera" | "microphone"): Promise<void> {
 /** Enable path: try a silent camera start first (permission may already be
  *  granted from a previous session); only fall back to the interactive
  *  permission tab if that fails for a permission-shaped reason. */
-async function startGestureCamera(): Promise<void> {
+async function startGestureCamera(language: LanguageCode = "en-IN"): Promise<void> {
   const creation = await ensureSharedOffscreenDocument();
   if (!creation.ok) return;
 
-  const result = await requestOffscreenCameraStart();
+  const result = await requestOffscreenCameraStart(language);
   if (result?.ok) {
     console.log("[SignSync] gesture camera active (permission already granted)");
     return;
@@ -215,11 +248,11 @@ async function stopGestureCamera(): Promise<void> {
   await closeSharedOffscreenDocumentIfIdle();
 }
 
-async function requestOffscreenCaptionsStart(): Promise<
-  { ok: boolean; status: string; errorMessage?: string } | undefined
-> {
+async function requestOffscreenCaptionsStart(
+  language: LanguageCode,
+): Promise<{ ok: boolean; status: string; errorMessage?: string } | undefined> {
   try {
-    const result = (await chrome.runtime.sendMessage({ type: "CAPTIONS_START" })) as
+    const result = (await chrome.runtime.sendMessage({ type: "CAPTIONS_START", payload: { language } })) as
       | { ok: boolean; status: string; errorMessage?: string }
       | undefined;
     console.log("[SignSync] offscreen captions start result:", result);
@@ -232,12 +265,15 @@ async function requestOffscreenCaptionsStart(): Promise<
 
 /** Enable path for Live Captions -- same silent-first, permission-tab-
  *  fallback shape as startGestureCamera(), but for the microphone and a
- *  browser-support check instead of the camera. */
-async function startCaptions(): Promise<void> {
+ *  browser-support check instead of the camera. `language` (Phase 10 Part
+ *  8) configures the browser SpeechRecognition session's recognition
+ *  language -- see offscreen.ts's startCaptions(), which is the only place
+ *  that actually sets `.lang` on the instance. */
+async function startCaptions(language: LanguageCode): Promise<void> {
   const creation = await ensureSharedOffscreenDocument();
   if (!creation.ok) return;
 
-  const result = await requestOffscreenCaptionsStart();
+  const result = await requestOffscreenCaptionsStart(language);
   if (result?.ok) {
     console.log("[SignSync] captions active (permission already granted)");
     return;
@@ -285,7 +321,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   }
 
   if (result.ok) {
-    requestOffscreenCameraStart().then(sendResponse);
+    getState().then((state) => requestOffscreenCameraStart(state.language)).then(sendResponse);
     return true;
   }
 
@@ -305,7 +341,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   }
 
   if (result.ok) {
-    requestOffscreenCaptionsStart().then(sendResponse);
+    getState().then((state) => requestOffscreenCaptionsStart(state.language)).then(sendResponse);
     return true;
   }
 

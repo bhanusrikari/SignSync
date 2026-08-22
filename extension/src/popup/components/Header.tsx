@@ -1,10 +1,19 @@
 import { Hand } from "lucide-react";
+import { t } from "@/i18n";
+import type { LanguageCode } from "@/types";
 
 interface HeaderProps {
   enabled: boolean;
+  language: LanguageCode;
 }
 
-export function Header({ enabled }: HeaderProps) {
+/** The popup's page heading (Phase 11 Part I) -- an <h1>, not a <p>, so
+ *  screen-reader users navigating by heading can identify this as the
+ *  page's title. Purely a semantic tag change: identical Tailwind classes,
+ *  no visual difference. "SignSync" itself stays untranslated (a proper
+ *  name, per the i18n audit's documented exception), but the tagline and
+ *  status badge are localized. */
+export function Header({ enabled, language }: HeaderProps) {
   return (
     <div className="flex items-center justify-between bg-brand-600 px-4 py-3.5 text-white">
       <div className="flex items-center gap-2">
@@ -12,8 +21,8 @@ export function Header({ enabled }: HeaderProps) {
           <Hand className="h-4.5 w-4.5" />
         </span>
         <div>
-          <p className="text-sm font-bold leading-tight">SignSync</p>
-          <p className="text-[11px] leading-tight text-brand-50">AI Accessibility Companion</p>
+          <h1 className="text-sm font-bold leading-tight">SignSync</h1>
+          <p className="text-[11px] leading-tight text-brand-50">{t("app.tagline", language)}</p>
         </div>
       </div>
       <span
@@ -21,7 +30,7 @@ export function Header({ enabled }: HeaderProps) {
           enabled ? "bg-emerald-400 text-emerald-950" : "bg-white/20 text-white"
         }`}
       >
-        {enabled ? "Enabled" : "Disabled"}
+        {enabled ? t("validate.enabled", language) : t("validate.disabledLabel", language)}
       </span>
     </div>
   );

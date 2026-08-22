@@ -28,6 +28,10 @@ describe("classifySpeechRecognitionError", () => {
     expect(classifySpeechRecognitionError("aborted")).toBe("aborted");
   });
 
+  it('maps "language-not-supported" to language_not_supported (Phase 10 Part 8)', () => {
+    expect(classifySpeechRecognitionError("language-not-supported")).toBe("language_not_supported");
+  });
+
   it("maps an unknown error code to the generic error status", () => {
     expect(classifySpeechRecognitionError("some-future-error-code")).toBe("error");
   });
